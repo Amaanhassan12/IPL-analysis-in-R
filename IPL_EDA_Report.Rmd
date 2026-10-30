@@ -1,0 +1,533 @@
+---
+title: "Predictors of Victory in the Indian Premier League: An Exploratory Data Analysis in R"
+author: "Your Name"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    code_folding: show
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.width = 9, fig.height = 5.5, dpi = 120)
+library(tidyverse)
+library(lubridate)
+library(readxl)
+library(scales)
+library(broom)
+source("R/helpers.R")
+theme_set(theme_minimal(base_size = 12))
+set.seed(2026)
+```
+
+# Introduction
+
+## Background
+The Indian Premier League (IPL) is the world's most-watched Twenty20 cricket league. With only 40 overs of play in a match, small advantages (winning the toss, batting first or second, a fast powerplay, a strong finish) can decide the result. This project explores **which factors are associated with winning an IPL match**.
+
+## Research questions
+1. Does winning the toss improve the chance of winning the match?
+2. Is it better to bat first or chase? Does this vary by season and venue?
+3. Is there a home-ground advantage?
+4. Which phases of an innings (powerplay, middle overs, death overs) and which batting/bowling indicators separate winners from losers?
+5. Which predictors remain important when considered together in a statistical model?
+
+## Data
+Data come from the Kaggle IPL dataset (2008-2019) supplied with the project:
+
+| File | Content |
+|---|---|
+| `matches.csv` | One row per match: teams, toss, venue, winner, margin, player of the match |
+| `deliveries.csv` | Ball-by-ball data for every innings |
+| `teamwise_home_and_away.csv` | Home/away wins and win % per team |
+| `most_runs_average_strikerate.csv` | Career batting summary per batsman |
+| `Players.xlsx` | Player profiles (batting hand, bowling skill, country) |
+
+# Data loading and cleaning
+
+```{r load}
+matches    <- read_csv("data/matches.csv", show_col_types = FALSE)
+deliveries <- read_csv("data/deliveries.csv", show_col_types = FALSE)
+home_away  <- read_csv("data/teamwise_home_and_away.csv", show_col_types = FALSE)
+batsmen    <- read_csv("data/most_runs_average_strikerate.csv", show_col_types = FALSE)
+players    <- read_excel("data/Players.xlsx")
+
+dim(matches); dim(deliveries)
+```
+
+## Missing values
+
+```{r missing}
+matches %>%
+  summarise(across(everything(), ~ sum(is.na(.x)))) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "n_missing") %>%
+  filter(n_missing > 0)
+```
+
+`umpire3` is mostly empty (not used). Missing `winner` values correspond to matches with **no result** (rain/abandoned), which cannot be used to study victory, so they are removed.
+
+## Cleaning steps
+
+```{r clean}
+matches <- matches %>%
+  rename(season_raw = Season) %>%
+  mutate(
+    season = as.integer(str_extract(season_raw, "\\d{4}")),
+    date   = dmy(date),
+    across(c(team1, team2, toss_winner, winner), standardise_team)
+  )
+
+deliveries <- deliveries %>%
+  mutate(across(c(batting_team, bowling_team), standardise_team))
+
+# Matches with a decisive result (a tie is decided by a super over, so a winner exists)
+decided <- matches %>%
+  filter(!is.na(winner)) %>%
+  mutate(
+    toss_win_match_win = toss_winner == winner,
+    bat_first_team = case_when(
+      toss_decision == "bat"   ~ toss_winner,
+      toss_decision == "field" ~ if_else(toss_winner == team1, team2, team1)
+    ),
+    bat_first_won = winner == bat_first_team
+  )
+
+cat("Matches in file:", nrow(matches),
+    "| decided matches used:", nrow(decided), "\n")
+```
+
+Two franchise names were inconsistent (`Rising Pune Supergiant(s)`) or renamed (`Delhi Daredevils` -> `Delhi Capitals`) and were harmonised. Deccan Chargers and Sunrisers Hyderabad are kept separate because they are different franchises.
+
+# Overview of the league
+
+## Matches per season
+
+```{r per-season}
+matches %>%
+  count(season) %>%
+  ggplot(aes(factor(season), n)) +
+  geom_col(fill = "#1f4e79") +
+  geom_text(aes(label = n), vjust = -0.4, size = 3.5) +
+  labs(title = "Matches played per season", x = "Season", y = "Matches")
+```
+
+## Team success
+
+```{r team-success}
+team_record <- bind_rows(
+  decided %>% transmute(team = team1, won = winner == team1),
+  decided %>% transmute(team = team2, won = winner == team2)
+) %>%
+  group_by(team) %>%
+  summarise(matches = n(), wins = sum(won), win_pct = wins / matches, .groups = "drop") %>%
+  arrange(desc(win_pct))
+
+team_record
+
+team_record %>%
+  filter(matches >= 30) %>%
+  ggplot(aes(reorder(short_team(team), win_pct), win_pct)) +
+  geom_col(fill = "#c0392b") +
+  geom_hline(yintercept = 0.5, linetype = "dashed") +
+  coord_flip() +
+  scale_y_continuous(labels = percent) +
+  labs(title = "Overall win percentage (teams with 30+ matches)",
+       x = NULL, y = "Win %")
+```
+
+## Winning margins
+
+```{r margins}
+decided %>%
+  filter(win_by_runs > 0 | win_by_wickets > 0) %>%
+  mutate(type   = if_else(win_by_runs > 0, "Won by runs (batting first)", "Won by wickets (chasing)"),
+         margin = if_else(win_by_runs > 0, win_by_runs, win_by_wickets)) %>%
+  ggplot(aes(margin, fill = type)) +
+  geom_histogram(bins = 25, colour = "white") +
+  facet_wrap(~ type, scales = "free") +
+  scale_fill_manual(values = c("#1f4e79", "#c0392b")) +
+  labs(title = "Distribution of winning margins", x = "Margin", y = "Matches") +
+  theme(legend.position = "none")
+```
+
+# Does the toss matter?
+
+```{r toss-overall}
+toss_tab <- decided %>% count(toss_win_match_win)
+toss_tab
+
+toss_test <- binom.test(sum(decided$toss_win_match_win), nrow(decided), p = 0.5)
+toss_test
+```
+
+If the toss had no influence, the toss winner would win about 50% of matches. The observed proportion is **`r percent(toss_test$estimate, 0.1)`** (95% CI `r percent(toss_test$conf.int[1], 0.1)` to `r percent(toss_test$conf.int[2], 0.1)`; p = `r round(toss_test$p.value, 3)`).
+
+## Toss decision and outcome
+
+```{r toss-decision}
+decided %>%
+  group_by(toss_decision) %>%
+  summarise(n = n(), toss_winner_won = mean(toss_win_match_win), .groups = "drop")
+
+decided %>%
+  count(season, toss_decision) %>%
+  group_by(season) %>% mutate(share = n / sum(n)) %>%
+  ggplot(aes(factor(season), share, fill = toss_decision)) +
+  geom_col() +
+  scale_y_continuous(labels = percent) +
+  scale_fill_manual(values = c(bat = "#e67e22", field = "#2980b9")) +
+  labs(title = "What do captains choose after winning the toss?",
+       x = "Season", y = "Share of matches", fill = "Decision")
+```
+
+```{r toss-by-season}
+decided %>%
+  group_by(season) %>%
+  summarise(toss_winner_won = mean(toss_win_match_win), n = n()) %>%
+  ggplot(aes(season, toss_winner_won)) +
+  geom_hline(yintercept = 0.5, linetype = "dashed") +
+  geom_line(colour = "#1f4e79") + geom_point(size = 2.5, colour = "#1f4e79") +
+  scale_y_continuous(labels = percent, limits = c(0.3, 0.7)) +
+  scale_x_continuous(breaks = unique(decided$season)) +
+  labs(title = "Toss winners' win rate by season", x = "Season", y = "Toss winner won match")
+```
+
+**Interpretation.** Check the confidence interval above: if it includes 50%, the toss on its own is *not* a statistically reliable predictor of victory, even though captains overwhelmingly choose to field first in recent seasons.
+
+# Batting first or chasing?
+
+```{r bat-first}
+bf_test <- binom.test(sum(decided$bat_first_won), nrow(decided), p = 0.5)
+bf_test
+
+decided %>%
+  group_by(season) %>%
+  summarise(bat_first_win = mean(bat_first_won), n = n()) %>%
+  ggplot(aes(factor(season), bat_first_win)) +
+  geom_col(fill = "#16a085") +
+  geom_hline(yintercept = 0.5, linetype = "dashed") +
+  scale_y_continuous(labels = percent) +
+  labs(title = "Win rate of the team batting first, by season",
+       x = "Season", y = "Bat-first win %")
+```
+
+## Venue effect
+
+```{r venue}
+venue_tab <- decided %>%
+  group_by(venue) %>%
+  summarise(n = n(), bat_first_win = mean(bat_first_won), .groups = "drop") %>%
+  filter(n >= 20) %>%
+  arrange(desc(bat_first_win))
+
+venue_tab
+
+ggplot(venue_tab, aes(reorder(venue, bat_first_win), bat_first_win)) +
+  geom_col(fill = "#8e44ad") +
+  geom_hline(yintercept = 0.5, linetype = "dashed") +
+  coord_flip() +
+  scale_y_continuous(labels = percent) +
+  labs(title = "Bat-first win % by venue (20+ matches)", x = NULL, y = "Bat-first win %")
+```
+
+# Home advantage
+
+```{r home}
+home_long <- home_away %>%
+  select(team, home_win_percentage, away_win_percentage) %>%
+  pivot_longer(-team, names_to = "where", values_to = "win_pct") %>%
+  mutate(where = recode(where, home_win_percentage = "Home", away_win_percentage = "Away"))
+
+ggplot(home_long, aes(reorder(short_team(team), win_pct), win_pct, fill = where)) +
+  geom_col(position = "dodge") +
+  coord_flip() +
+  scale_fill_manual(values = c(Home = "#2c3e50", Away = "#f39c12")) +
+  labs(title = "Home vs away win percentage by team", x = NULL, y = "Win %", fill = NULL)
+
+home_total <- home_away %>%
+  summarise(home_w = sum(home_wins), home_m = sum(home_matches),
+            away_w = sum(away_wins), away_m = sum(away_matches))
+home_total
+```
+
+```{r home-test}
+prop.test(c(home_total$home_w, home_total$away_w),
+          c(home_total$home_m, home_total$away_m))
+```
+
+A formal comparison of pooled home and away win rates shows whether playing at home gives a measurable edge. Note that every match has one home side and one away side only when played at a home venue; neutral venues (e.g. South Africa 2009, UAE 2014) dilute the effect.
+
+# Ball-by-ball features: what separates winners from losers?
+
+## Building team-innings features
+
+Only regulation innings (1 and 2, no super overs) from decided matches without Duckworth-Lewis adjustment are used so that run rates are comparable. Phases are: **powerplay** (overs 1-6), **middle** (7-15) and **death** (16-20).
+
+```{r features}
+valid_ids <- decided %>% filter(dl_applied == 0) %>% pull(id)
+
+innings <- deliveries %>%
+  filter(match_id %in% valid_ids, is_super_over == 0, inning %in% c(1, 2)) %>%
+  mutate(
+    legal     = wide_runs == 0 & noball_runs == 0,
+    phase     = over_phase(over),
+    wicket    = !is.na(player_dismissed),
+    boundary  = batsman_runs %in% c(4, 6),
+    dot       = legal & total_runs == 0
+  )
+
+# one row per team-innings
+overall <- innings %>%
+  group_by(match_id, inning, batting_team) %>%
+  summarise(
+    runs        = sum(total_runs),
+    wickets     = sum(wicket),
+    legal_balls = sum(legal),
+    boundary_pct = sum(boundary) / sum(legal),
+    dot_pct      = sum(dot) / sum(legal),
+    extras_recv  = sum(extra_runs),
+    .groups = "drop"
+  ) %>%
+  mutate(overall_rr = runs / (legal_balls / 6))
+
+phase_stats <- innings %>%
+  group_by(match_id, inning, batting_team, phase) %>%
+  summarise(runs = sum(total_runs), balls = sum(legal), wkts = sum(wicket), .groups = "drop") %>%
+  mutate(rr = if_else(balls > 0, runs / (balls / 6), NA_real_)) %>%
+  pivot_wider(names_from = phase, values_from = c(runs, balls, wkts, rr),
+              names_glue = "{phase}_{.value}")
+
+team_innings <- overall %>%
+  left_join(phase_stats, by = c("match_id", "inning", "batting_team")) %>%
+  # Chasing sides often finish before the death overs: use overall run rate in that case
+  mutate(
+    powerplay_rr = coalesce(powerplay_rr, overall_rr),
+    middle_rr    = coalesce(middle_rr, overall_rr),
+    death_rr     = coalesce(death_rr, overall_rr),
+    powerplay_wkts = coalesce(powerplay_wkts, 0L),
+    death_wkts     = coalesce(death_wkts, 0L)
+  ) %>%
+  inner_join(decided %>% select(id, winner, toss_winner, season, venue),
+             by = c("match_id" = "id")) %>%
+  mutate(
+    won       = winner == batting_team,
+    bat_first = inning == 1,
+    toss_won  = toss_winner == batting_team
+  )
+
+nrow(team_innings)
+```
+
+## Winners versus losers
+
+```{r winners-losers}
+feature_vars <- c("powerplay_rr", "middle_rr", "death_rr", "overall_rr",
+                  "boundary_pct", "dot_pct", "wickets", "powerplay_wkts", "death_wkts")
+
+team_innings %>%
+  select(won, all_of(feature_vars)) %>%
+  pivot_longer(-won, names_to = "feature", values_to = "value") %>%
+  mutate(result = if_else(won, "Winner", "Loser")) %>%
+  ggplot(aes(result, value, fill = result)) +
+  geom_boxplot(outlier.alpha = 0.3) +
+  facet_wrap(~ feature, scales = "free_y") +
+  scale_fill_manual(values = c(Winner = "#27ae60", Loser = "#c0392b")) +
+  labs(title = "Team-innings indicators for winners and losers", x = NULL, y = NULL) +
+  theme(legend.position = "none")
+```
+
+```{r ttests}
+map_dfr(feature_vars, function(v) {
+  tt <- t.test(team_innings[[v]] ~ team_innings$won)
+  tibble(feature = v,
+         mean_loser  = tt$estimate[1],
+         mean_winner = tt$estimate[2],
+         difference  = tt$estimate[2] - tt$estimate[1],
+         p_value     = tt$p.value)
+}) %>%
+  arrange(p_value) %>%
+  mutate(across(c(mean_loser, mean_winner, difference), ~ round(.x, 2)),
+         p_value = signif(p_value, 3))
+```
+
+## Correlation between indicators
+
+```{r corr}
+cor_mat <- team_innings %>%
+  select(won, all_of(feature_vars)) %>%
+  mutate(won = as.numeric(won)) %>%
+  cor(use = "complete.obs")
+
+cor_mat %>%
+  as_tibble(rownames = "var1") %>%
+  pivot_longer(-var1, names_to = "var2", values_to = "r") %>%
+  ggplot(aes(var1, var2, fill = r)) +
+  geom_tile() +
+  geom_text(aes(label = round(r, 2)), size = 3) +
+  scale_fill_gradient2(low = "#c0392b", mid = "white", high = "#2980b9", limits = c(-1, 1)) +
+  labs(title = "Correlation matrix", x = NULL, y = NULL) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+## Toss, batting order and phase scoring
+
+```{r phase-by-order}
+team_innings %>%
+  group_by(bat_first) %>%
+  summarise(across(c(powerplay_rr, middle_rr, death_rr), mean), win_rate = mean(won)) %>%
+  mutate(bat_first = if_else(bat_first, "Batting first", "Chasing"))
+```
+
+# Predictive model
+
+## Set-up
+To compare the two teams in one match we model the outcome from the perspective of the **team batting first**. Each predictor is the *difference* (bat-first team minus chasing team), which controls for the strength of the opposition within the match. Predictors are standardised, so each odds ratio is "per 1 standard deviation".
+
+Wickets lost by a chasing side are mechanically linked to the result (a chase succeeds before wickets run out), so the model is explanatory rather than a pre-match forecast. A pre-match model would use only toss, venue and team strength.
+
+```{r model-data}
+wide <- team_innings %>%
+  select(match_id, inning, batting_team, won, toss_won, powerplay_rr, middle_rr, death_rr,
+         boundary_pct, dot_pct, wickets) %>%
+  pivot_wider(names_from = inning,
+              values_from = c(batting_team, won, toss_won, powerplay_rr, middle_rr, death_rr,
+                              boundary_pct, dot_pct, wickets),
+              names_sep = "_i") %>%
+  drop_na()
+
+model_df <- wide %>%
+  transmute(
+    match_id,
+    bat_first_won = as.integer(won_i1),
+    toss_won_batfirst = as.integer(toss_won_i1),
+    d_powerplay_rr = powerplay_rr_i1 - powerplay_rr_i2,
+    d_middle_rr    = middle_rr_i1 - middle_rr_i2,
+    d_death_rr     = death_rr_i1 - death_rr_i2,
+    d_boundary_pct = boundary_pct_i1 - boundary_pct_i2,
+    d_dot_pct      = dot_pct_i1 - dot_pct_i2,
+    d_wickets      = wickets_i1 - wickets_i2
+  ) %>%
+  mutate(across(starts_with("d_"), ~ as.numeric(scale(.x))))
+
+nrow(model_df)
+```
+
+## Logistic regression
+
+```{r glm}
+train_idx <- sample(nrow(model_df), size = round(0.8 * nrow(model_df)))
+train <- model_df[train_idx, ]
+test  <- model_df[-train_idx, ]
+
+fit <- glm(bat_first_won ~ toss_won_batfirst + d_powerplay_rr + d_middle_rr + d_death_rr +
+             d_boundary_pct + d_dot_pct + d_wickets,
+           data = train, family = binomial())
+
+summary(fit)
+```
+
+```{r odds-ratios}
+or_tab <- tidy(fit, conf.int = TRUE, exponentiate = TRUE) %>%
+  filter(term != "(Intercept)")
+or_tab
+
+ggplot(or_tab, aes(estimate, reorder(term, estimate))) +
+  geom_vline(xintercept = 1, linetype = "dashed") +
+  geom_pointrange(aes(xmin = conf.low, xmax = conf.high), colour = "#1f4e79") +
+  scale_x_log10() +
+  labs(title = "Odds ratios for the bat-first team winning (95% CI)",
+       x = "Odds ratio (log scale)", y = NULL)
+```
+
+## Model performance
+
+```{r performance}
+test$pred_prob  <- predict(fit, newdata = test, type = "response")
+test$pred_class <- as.integer(test$pred_prob > 0.5)
+
+conf <- table(Actual = test$bat_first_won, Predicted = test$pred_class)
+conf
+
+accuracy <- mean(test$pred_class == test$bat_first_won)
+baseline <- max(prop.table(table(test$bat_first_won)))
+tibble(accuracy = accuracy, majority_class_baseline = baseline)
+```
+
+The model accuracy on unseen matches is `r percent(accuracy, 0.1)` compared with `r percent(baseline, 0.1)` for always guessing the more common outcome.
+
+## Random forest (optional check)
+
+```{r rf, eval=requireNamespace("randomForest", quietly = TRUE)}
+library(randomForest)
+rf <- randomForest(factor(bat_first_won) ~ ., data = train %>% select(-match_id),
+                   importance = TRUE, ntree = 500)
+imp <- as_tibble(importance(rf), rownames = "variable") %>% arrange(desc(MeanDecreaseGini))
+imp
+
+ggplot(imp, aes(MeanDecreaseGini, reorder(variable, MeanDecreaseGini))) +
+  geom_col(fill = "#16a085") +
+  labs(title = "Random forest variable importance", x = "Mean decrease in Gini", y = NULL)
+```
+
+# Players: match-winners and batting quality
+
+## Player of the match
+
+```{r pom}
+decided %>%
+  filter(!is.na(player_of_match)) %>%
+  count(player_of_match, sort = TRUE) %>%
+  slice_head(n = 12) %>%
+  ggplot(aes(reorder(player_of_match, n), n)) +
+  geom_col(fill = "#d35400") +
+  coord_flip() +
+  labs(title = "Most Player-of-the-Match awards", x = NULL, y = "Awards")
+```
+
+## Average versus strike rate of leading batsmen
+
+```{r batsmen}
+batsmen %>%
+  filter(total_runs >= 1500) %>%
+  ggplot(aes(average, strikerate, size = total_runs, label = batsman)) +
+  geom_point(alpha = 0.6, colour = "#2980b9") +
+  geom_text(data = ~ slice_max(.x, total_runs, n = 8), size = 3, vjust = -1.2,
+            show.legend = FALSE) +
+  labs(title = "Batting average vs strike rate (1,500+ IPL runs)",
+       x = "Batting average", y = "Strike rate", size = "Runs")
+```
+
+```{r players-info}
+players %>%
+  mutate(Batting_Hand = str_to_title(str_replace(Batting_Hand, "_", " "))) %>%
+  count(Batting_Hand, sort = TRUE)
+```
+
+# Conclusions
+
+Answer each research question using the output above (numbers update automatically when you knit):
+
+1. **Toss** - compare the toss-winner win rate and its confidence interval with 50%.
+2. **Batting order** - report the bat-first win rate by season and the venues that favour batting first or chasing.
+3. **Home advantage** - report the pooled home vs away win rates and the test result.
+4. **Phase indicators** - the t-test table ranks which indicators differ most between winners and losers.
+5. **Model** - the odds-ratio plot shows which predictors keep a significant effect after adjusting for the others.
+
+## Limitations
+- Data cover 2008-2019 only.
+- Team strength (squad quality) is not directly modelled.
+- Chasing innings are truncated when the target is reached, which affects phase run rates and wickets.
+- Duckworth-Lewis and no-result matches were excluded from ball-by-ball modelling.
+
+## Future work
+Add team-strength ratings (e.g. Elo), player-level features, and a pre-match model using only information available before the first ball.
+
+# Session information
+
+```{r session}
+sessionInfo()
+```
